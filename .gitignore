@@ -1,0 +1,9 @@
+# Installed by the profile that consumes this plugin, never committed.
+node_modules/
+package-lock.json
+
+# Smoke-test leftovers.
+.data/
+*.log
+link.txt
+cookies.txt

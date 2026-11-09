@@ -1,0 +1,52 @@
+{
+  "name": "@ikauann/dsh-opentunnel",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenTunnel route for the DSH Web GUI: a Settings switch that opens a public HTTPS URL for the phone, a QR code to walk in, and the listener kept on loopback behind an authority-rewriting proxy.",
+  "license": "MIT",
+  "author": "ikauann",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikauann/dsh-opentunnel.git"
+  },
+  "homepage": "https://github.com/ikauann/dsh-opentunnel#readme",
+  "keywords": ["dsh", "dsh-plugin", "opentunnel", "tunnel", "mobile", "qr"],
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "test/smoke.mjs",
+    "test/client.smoke.mjs",
+    "test/loader.mjs",
+    "test/resolve-hook.mjs"
+  ],
+  "dependencies": {
+    "@opentunnel/client": "0.6.2",
+    "effect": "4.0.2",
+    "uqr": "^0.1.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  }
+}

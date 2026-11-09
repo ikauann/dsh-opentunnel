@@ -1,0 +1,18 @@
+# dsh-opentunnel: a public HTTPS route to this Web listener.
+#
+# `rewrite: true` puts a loopback proxy in front of the listener and points the
+# tunnel at it, so Connection's Host/Origin fence sees loopback and the GUI
+# works from the phone with no `--trusted-host` flag. Turning it off requires
+# starting `dsh --profile web --trusted-host <tunnel host>`.
+#
+# `enabled` is the first-boot state only: afterwards the Settings switch owns it
+# and the choice is remembered in `$DSH_HOME/opentunnel.json`.
+- insert:
+    - id: opentunnel
+      name: '@ikauann/dsh-opentunnel'
+      config:
+        enabled: true
+        routeName: '@'
+        profile: dsh
+        rewrite: true
+        printLink: true

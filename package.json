@@ -1,6 +1,6 @@
 {
   "name": "@ikauann/dsh-opentunnel",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "OpenTunnel route for the DSH Web GUI: a Settings switch that opens a public HTTPS URL for the phone, a QR code to walk in, and the listener kept on loopback behind an authority-rewriting proxy.",

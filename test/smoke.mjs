@@ -11,6 +11,8 @@
  *
  * Usage: node test/smoke.mjs <token-do-DSH> [targetPort]
  */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import https from 'node:https'
 import crypto from 'node:crypto'
 import { apply, Config } from '../index.js'
@@ -111,15 +113,24 @@ check('rota pública anexou', clean?.startsWith('https://') === true)
 check('proxy de reescrita de pé', connected.rewrite === true && connected.proxyPort > 0)
 
 const link = await get('/link')
-check('/link devolve o link com token', link.body.url === `${clean}/?token=${TOKEN}`)
+const hostname = new URL(clean).hostname
+const code = JSON.parse(readFileSync(join(process.env.DSH_HOME, 'opentunnel.json'), 'utf8')).entryCode
+check('/link devolve o link permanente', link.body.url === `https://${hostname}/e/${code}` && link.body.durable === true)
 const qr = await get('/qr')
-check('/qr devolve SVG', qr.body.svg.startsWith('<svg') && qr.body.svg.includes('path'))
+check('/qr devolve SVG do link permanente', qr.body.svg.startsWith('<svg') && qr.body.url === link.body.url)
 
-// ── o fluxo do celular ─────────────────────────────────────────────────────
+// ── a porta permanente e o fluxo do celular ────────────────────────────────
+const door = await fetch(`${clean}/e/${code}`, { redirect: 'manual' })
+const doorTo = door.headers.get('location') ?? ''
+check('porta permanente -> 302 com o token atual', door.status === 302 && doorTo.includes(`token=${TOKEN}`))
+
+const wrongCode = await fetch(`${clean}/e/${'0'.repeat(32)}`, { redirect: 'manual' })
+check('código errado -> 403', wrongCode.status === 403)
+
 const unauth = await fetch(`${clean}/`, { redirect: 'manual' })
 check('sem token no celular -> 401', unauth.status === 401)
 
-const exchange = await fetch(`${clean}/?token=${TOKEN}`, { redirect: 'manual' })
+const exchange = await fetch(doorTo, { redirect: 'manual' })
 const cookie = (exchange.headers.getSetCookie() ?? []).map((c) => c.split(';')[0]).join('; ')
 check('troca do token -> 303 + cookie', exchange.status === 303 && cookie.length > 0)
 

@@ -22,7 +22,7 @@
  */
 import { createServer, request as httpRequest } from "node:http";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import z from "@deepseek-ai/schemastery";
@@ -89,6 +89,14 @@ const HOP_BY_HOP = new Set([
 const PANEL_HEADER = "x-dsh-opentunnel";
 
 /**
+ * Path prefix of the durable entry link. DSH's launch token is per process, and
+ * the tunnel hostname is stable, so a saved URL dies at every restart. This path
+ * answers with a redirect to the current process token instead, which makes one
+ * scanned link keep working for the life of the installation.
+ */
+const ENTRY_PREFIX = "/e/";
+
+/**
  * Headers for one upstream exchange: authorities rewritten onto the loopback
  * target, hop-by-hop fields dropped so the proxy's own framing wins.
  * @param headers - the inbound request headers.
@@ -120,9 +128,34 @@ function upstreamHeaders(headers, target) {
  * @returns the proxy's listening port and a closer.
  */
 async function startRewriteProxy(options) {
-  const { host, port, targetPort } = options;
+  const { host, port, targetPort, entry } = options;
+
+  /** The durable entry link, or undefined when this request is an ordinary one. */
+  const entryCode = (req) => {
+    if (req.method !== "GET") return undefined;
+    const path = req.url ?? "";
+    if (!path.startsWith(ENTRY_PREFIX)) return undefined;
+    return path.slice(ENTRY_PREFIX.length).split("?")[0].replace(/\/+$/, "");
+  };
 
   const forward = (req, res) => {
+    const code = entryCode(req);
+    if (code !== undefined) {
+      // The durable door: a wrong code never reaches the listener, and the right
+      // one hands the browser the current process token so the cookie is minted.
+      if (entry !== undefined && code.length > 0 && code === entry.code()) {
+        const target = entry.url();
+        if (target.length > 0) {
+          res.writeHead(302, { location: target, "cache-control": "no-store" });
+          res.end();
+          return;
+        }
+      }
+      res.writeHead(403, { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" });
+      res.end("opentunnel: código de entrada inválido. Abra o QR em Configurações → OpenTunnel.\n");
+      return;
+    }
+
     const upstream = httpRequest(
       {
         host: "127.0.0.1",
@@ -231,33 +264,44 @@ export function apply(ctx, config) {
   let disposed = false;
   let queue = Promise.resolve();
 
-  /** Where the tokenised URL lands when the configuration names no file. */
+  /**
+   * The durable entry code. DSH's launch token is minted per process, so a saved
+   * URL stops working at the next restart even though the hostname and the path
+   * look identical. This code is generated once, persisted next to the toggle,
+   * and exchanged for the current token by the proxy — one scanned link, forever.
+   */
+  let entryCode = "";
+
+  /** Where the durable link lands when the configuration names no file. */
   const linkPath = () =>
     config.linkFile.length > 0
       ? config.linkFile
       : join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "opentunnel-link.txt");
 
-  /** Where the toggle survives a restart. */
+  /** Where the toggle and the entry code survive a restart. */
   const statePath = () => join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "opentunnel.json");
 
-  /** Read the remembered preference once, before the first activation. */
-  const readPreference = () => {
-    if (!config.persist) return undefined;
+  /** Read the remembered preference and entry code once, before the first activation. */
+  const readPersisted = () => {
+    if (!config.persist) return {};
     try {
       const parsed = JSON.parse(readFileSync(statePath(), "utf8"));
-      return typeof parsed?.enabled === "boolean" ? parsed.enabled : undefined;
+      return {
+        enabled: typeof parsed?.enabled === "boolean" ? parsed.enabled : undefined,
+        entryCode: /^[a-f0-9]{32}$/.test(parsed?.entryCode ?? "") ? parsed.entryCode : undefined,
+      };
     } catch {
-      return undefined;
+      return {};
     }
   };
 
-  /** Write the preference, best effort: a read-only home must not break the toggle. */
-  const writePreference = () => {
+  /** Write the preference and the entry code, best effort: a read-only home must not break the toggle. */
+  const persist = () => {
     if (!config.persist) return;
     try {
       const path = statePath();
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, `${JSON.stringify({ enabled }, null, 2)}\n`);
+      writeFileSync(path, `${JSON.stringify({ enabled, entryCode }, null, 2)}\n`, { mode: 0o600 });
     } catch {
       /* the session keeps the choice even when the home cannot */
     }
@@ -297,8 +341,14 @@ export function apply(ctx, config) {
     return host.length === 0 ? "" : tokenisedUrl(`https://${host}/`);
   };
 
+  /** The durable link: stable across restarts because the code is, and it exchanges for the live token. */
+  const currentEntryUrl = () => {
+    const host = tunnelHost();
+    return host.length === 0 || entryCode.length === 0 ? "" : `https://${host}${ENTRY_PREFIX}${entryCode}`;
+  };
+
   const publishLink = () => {
-    const link = currentLink();
+    const link = currentEntryUrl() || currentLink();
     if (link.length === 0) return;
     if (config.printLink) {
       // Same seat as the `dsh web:` line: the terminal, never the transcript.
@@ -328,6 +378,10 @@ export function apply(ctx, config) {
           host: config.rewriteHost,
           port: config.rewritePort,
           targetPort: port,
+          entry: {
+            code: () => entryCode,
+            url: () => currentLink(),
+          },
         });
         upstreamPort = rewrite.port;
         state.proxyPort = rewrite.port;
@@ -417,7 +471,7 @@ export function apply(ctx, config) {
 
   const setEnabled = async (on) => {
     enabled = on;
-    writePreference();
+    persist();
     if (on) {
       if (state.phase === "off" || state.phase === "error") await start();
     } else {
@@ -504,26 +558,27 @@ export function apply(ctx, config) {
     routePost("/enable", async () => ({ ok: true, ...(await serialize(() => setEnabled(true))) })),
     routePost("/disable", async () => ({ ok: true, ...(await serialize(() => setEnabled(false))) })),
     routeGet("/link", async () => {
-      const link = currentLink();
+      const link = currentEntryUrl() || currentLink();
       if (link.length === 0) {
         return json(
           { ok: false, error: { code: "no-link", message: "O túnel ainda não anexou; tente de novo quando o estado for connected." } },
           409,
         );
       }
-      return json({ ok: true, url: link, host: tunnelHost() });
+      return json({ ok: true, url: link, durable: link === currentEntryUrl(), host: tunnelHost() });
     }),
     routeGet("/qr", async () => {
-      const link = currentLink();
+      const link = currentEntryUrl() || currentLink();
       if (link.length === 0) {
         return json(
           { ok: false, error: { code: "no-link", message: "O túnel ainda não anexou; tente de novo quando o estado for connected." } },
           409,
         );
       }
-      // The QR carries the launch token, so it is rendered here, behind the
-      // panel token, and never in an <img> URL a third party could log.
-      return json({ ok: true, url: link, svg: renderSVG(link, { ecc: "L", border: 1 }) });
+      // The QR carries either the durable entry code or this process's token, so
+      // it is rendered here, behind the panel token, and never in an <img> URL a
+      // third party could log.
+      return json({ ok: true, url: link, durable: link === currentEntryUrl(), svg: renderSVG(link, { ecc: "L", border: 1 }) });
     }),
   ];
 
@@ -600,7 +655,9 @@ export function apply(ctx, config) {
     void teardown();
   });
 
-  const preference = readPreference();
-  if (preference !== undefined) enabled = preference;
+  const persisted = readPersisted();
+  if (persisted.enabled !== undefined) enabled = persisted.enabled;
+  entryCode = persisted.entryCode ?? randomBytes(16).toString("hex");
+  if (persisted.entryCode === undefined) persist();
   if (enabled) void serialize(() => start());
 }

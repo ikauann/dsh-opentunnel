@@ -363,7 +363,7 @@ window.__ModuleLoader__.load({
                   h(
                     "div",
                     { style: S.hint },
-                    "O código leva o token desta sessão. Abra uma vez: o DSH troca por um cookie de 30 dias e o celular entra direto.",
+                    "Este link é permanente: ele vale depois de reiniciar o DSH. Ao abrir, o túnel troca o código pelo token da sessão e o DSH devolve um cookie de 30 dias — por isso o celular entra direto.",
                   ),
                   h(
                     "div",
@@ -379,7 +379,7 @@ window.__ModuleLoader__.load({
           ? h(
               "p",
               { style: S.hint },
-              "Quem tiver este link tem o mesmo acesso que você nesta máquina. Para revogar, desligue o túnel ou reinicie o DSH — o token muda a cada processo.",
+              "Quem tiver este link tem o mesmo acesso que você nesta máquina, e ele não expira com o processo. Para revogar, apague o entryCode de ~/.dsh/opentunnel.json e reinicie o DSH — um código novo é gerado, e os links antigos morrem.",
             )
           : null,
       );

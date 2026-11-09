@@ -1,8 +1,9 @@
 # dsh-opentunnel
 
 Uma rota HTTPS pública para o GUI Web do DSH, ligada e desligada por um
-interruptor em **Configurações → OpenTunnel**, com QR code para entrar pelo
-celular. Sem VPN, sem app no telefone, sem abrir porta no roteador.
+interruptor em **Configurações → OpenTunnel**, com um QR code **permanente**
+para entrar pelo celular. Sem VPN, sem app no telefone, sem abrir porta no
+roteador.
 
 ![Seção OpenTunnel em Configurações](opentunnel-settings.png)
 
@@ -11,19 +12,33 @@ celular. Sem VPN, sem app no telefone, sem abrir porta no roteador.
 1. **Configurações → OpenTunnel** (no menu da conta, no pé da barra lateral).
 2. Ligue **Túnel público**. Na primeira vez leva uns 30 s: o túnel é criado e o
    certificado é emitido por ACME. Da segunda vez anexa em segundos.
-3. Aponte a câmera do celular para o QR. Ele abre a URL com o token desta
-   sessão; o DSH troca por um cookie assinado de 30 dias e o celular entra
-   direto — depois disso é só abrir a URL, sem token.
+3. Aponte a câmera do celular para o QR. Ele abre
+   `https://<host>/e/<código>`; o túnel troca esse código pelo token do processo
+   atual e o DSH devolve um cookie assinado de 30 dias. Depois disso o celular
+   entra direto, sem código.
 4. Desligue o interruptor quando não precisar. A rota pública morre na hora.
 
 O DSH também imprime o link no terminal, na mesma linha de boot:
 
 ```
 dsh web: http://127.0.0.1:3080/?token=…
-dsh opentunnel: https://dyoe4ezc2nvm.opentunnel.xyz/?token=…
+dsh opentunnel: https://tqeae3hifged.opentunnel.xyz/e/390abeb82886223d2c5dca1485769813
 ```
 
 E grava o mesmo link em `$DSH_HOME/opentunnel-link.txt` (modo 600).
+
+### Por que existe o `/e/<código>`
+
+O token que o DSH imprime é **por processo**: reiniciar o DSH troca o token, mas
+o hostname e o caminho continuam idênticos — então qualquer link salvo, favorito
+ou QR antigo passa a responder `401 dsh web authentication required`, mesmo
+parecendo a mesma URL.
+
+O `/e/<código>` resolve isso: o código é gerado uma vez, fica em
+`$DSH_HOME/opentunnel.json` e o proxy o troca pelo token vivo a cada abertura.
+O link não muda quando o DSH reinicia. Ele só depende do hostname do túnel (que
+também é estável, porque a identidade fica em
+`%USERPROFILE%\.local\share\opentunnel\`) e do túnel estar ligado.
 
 ## Por que existe um proxy no meio
 
@@ -39,8 +54,8 @@ Resultado: o visitante parece o que é, uma requisição local, e **nenhuma flag
 necessária**.
 
 Consequência a saber: o cookie fica preso a `127.0.0.1:<porta>`. Se você mudar a
-porta do listener, os cookies antigos param de valer e o celular precisa do QR
-de novo.
+porta do listener, os cookies antigos param de valer — mas o link permanente
+continua funcionando e emite um novo.
 
 ## Instalação
 
@@ -85,9 +100,9 @@ dsh --profile web
 | `rewritePort` | `0` | Porta do proxy; `0` pede uma ao SO. |
 | `targetPort` | `0` | Alvo do proxy; `0` lê a porta viva do listener. |
 | `panelPath` | `/opentunnel` | Família de rotas que a página consome. |
-| `linkFile` | `""` | Onde gravar o link com token; vazio usa `$DSH_HOME/opentunnel-link.txt`. |
+| `linkFile` | `""` | Onde gravar o link permanente; vazio usa `$DSH_HOME/opentunnel-link.txt`. |
 | `printLink` | `true` | Imprime o link no terminal quando a rota anexa. |
-| `persist` | `true` | Guarda a escolha do interruptor em `$DSH_HOME/opentunnel.json`. |
+| `persist` | `true` | Guarda o interruptor **e o código de entrada** em `$DSH_HOME/opentunnel.json`. Desligado, o link muda a cada boot. |
 
 ### Rotas que a página usa
 
@@ -99,8 +114,14 @@ Todas exigem o header `x-dsh-opentunnel`, cujo valor o Host injeta no documento
 | `GET /opentunnel/state` | estado, URL, porta do proxy, erro |
 | `POST /opentunnel/enable` | abre a rota |
 | `POST /opentunnel/disable` | fecha a rota |
-| `GET /opentunnel/link` | URL com token (409 enquanto não anexa) |
+| `GET /opentunnel/link` | link permanente (409 enquanto não anexa) |
 | `GET /opentunnel/qr` | o mesmo link como SVG de QR |
+
+E, **atrás do proxy** (só pelo túnel, nunca no listener local):
+
+| rota | o que faz |
+| --- | --- |
+| `GET /e/<código>` | 302 para `/?token=<token vivo>`; código errado responde 403 |
 
 ### Sem o proxy
 
@@ -108,22 +129,25 @@ Se preferir não ter o salto extra, desligue `rewrite` e suba o listener
 confiando no host do túnel:
 
 ```powershell
-dsh --profile web --trusted-host dyoe4ezc2nvm.opentunnel.xyz --public-url https://dyoe4ezc2nvm.opentunnel.xyz
+dsh --profile web --trusted-host tqeae3hifged.opentunnel.xyz --public-url https://tqeae3hifged.opentunnel.xyz
 ```
 
 `--public-url` só anuncia; `--trusted-host` é quem libera a autoridade no fence.
+Sem proxy não existe `/e/<código>`: aí volte a usar o link com token que o DSH
+imprime, que muda a cada reinício.
 
 ## Segurança
 
-- Sem token, a URL pública responde **401** em tudo — medido.
-- O QR carrega o token da sessão. Quem tem URL + token tem o agente inteiro, ou
-  seja execução de código nesta máquina. Ele fica no terminal, no
-  `opentunnel-link.txt` (modo 600) e na página de Configurações — **nunca** no
-  contexto do modelo.
+- Sem token e sem código, a URL pública responde **401** em tudo — medido.
+- **O link permanente é uma credencial durável**, como uma senha: quem o tiver
+  tem o agente inteiro, ou seja execução de código nesta máquina. Ele não expira
+  com o processo (é justamente o ponto). Para revogar, apague a chave
+  `entryCode` de `~/.dsh/opentunnel.json` e reinicie o DSH — um código novo é
+  gerado e todos os links antigos morrem.
+- O código tem 128 bits e nunca vai para o contexto do modelo: ele sai no
+  terminal, no `opentunnel-link.txt` (modo 600) e na página de Configurações.
 - O QR é renderizado no Host, atrás do token da página, e chega como SVG por
   fetch: o link não vira URL de `<img>` que terceiros possam logar.
-- Revogar = desligar o interruptor ou reiniciar o DSH (o token muda a cada
-  processo).
 - O certificado HTTPS termina neste processo (é o TLS do OpenTunnel, chave
   privada nunca sai daqui); o relay não vê plaintext.
 - Hostname de rota não aparece em Certificate Transparency, e `*.opentunnel.xyz`
@@ -135,14 +159,14 @@ dsh --profile web --trusted-host dyoe4ezc2nvm.opentunnel.xyz --public-url https:
   plugin usa o SDK TypeScript, que roda em Node — foi o caminho validado.
 - Uma rota pertence a um bridge por vez: se outro cliente estiver na mesma rota,
   o SDK fica re-tentando e assume quando ela soltar.
-- O túnel não autentica ninguém; quem autentica é o token do DSH.
+- O túnel não autentica ninguém; quem autentica é o DSH (token vivo + cookie).
 
 ## Verificação
 
 Duas provas, ambas contra um listener real e um túnel real:
 
 ```powershell
-# Host: interruptor, guards, link, QR, fluxo do celular e upgrade de WebSocket
+# Host: interruptor, guards, link permanente, porta /e/, fluxo do celular e WebSocket
 $env:DSH_CLI_ROOT="$(npm root -g)\@deepseek-ai\dsh"
 $env:XDG_DATA_HOME="$PWD\.data"   # identidade de teste em vez da sua
 node --import ./test/loader.mjs test/smoke.mjs <token-do-DSH> <porta>

@@ -21,7 +21,7 @@
  * @module @local/dsh-opentunnel
  */
 import { createServer, request as httpRequest } from "node:http";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -38,7 +38,7 @@ export const inject = ["tools", "webServer"];
 /** Plugin configuration. */
 export const Config = z.object({
   /** State for the first boot; afterwards the Settings toggle is the source of truth. */
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
   /**
    * Route name: `@` serves the tunnel hostname itself, a lowercase DNS label
    * serves `<route>.<hostname>`. OpenTunnel requires a fixed name; changing it
@@ -65,11 +65,19 @@ export const Config = z.object({
   targetPort: z.number().default(0),
   /** Route family the Settings page and the agent read tunnel state from. */
   panelPath: z.string().default("/opentunnel"),
-  /** File the tokenised URL is written to; empty means `$DSH_HOME/opentunnel-link.txt`. */
+  /**
+   * Lifetime of the durable entry link, in days. The code is a bearer credential
+   * in a URL, so it expires; opening the Settings QR or pressing "Novo link"
+   * mints another one.
+   */
+  entryTtlDays: z.number().default(7),
+  /** Append one line per entry-door hit and per bridge connection to `$DSH_HOME/opentunnel-access.log`. */
+  accessLog: z.boolean().default(true),
+  /** File the durable URL is written to; empty means `$DSH_HOME/opentunnel-link.txt`. */
   linkFile: z.string().default(""),
-  /** Print the tokenised URL to stdout when the route attaches. */
+  /** Print the durable URL to stdout when the route attaches. */
   printLink: z.boolean().default(true),
-  /** Remember the Settings toggle across restarts, next to the Harness home. */
+  /** Remember the Settings toggle, the entry code and its expiry across restarts. */
   persist: z.boolean().default(true),
 });
 
@@ -128,7 +136,7 @@ function upstreamHeaders(headers, target) {
  * @returns the proxy's listening port and a closer.
  */
 async function startRewriteProxy(options) {
-  const { host, port, targetPort, entry } = options;
+  const { host, port, targetPort, entry, onAccess } = options;
 
   /** The durable entry link, or undefined when this request is an ordinary one. */
   const entryCode = (req) => {
@@ -141,18 +149,19 @@ async function startRewriteProxy(options) {
   const forward = (req, res) => {
     const code = entryCode(req);
     if (code !== undefined) {
-      // The durable door: a wrong code never reaches the listener, and the right
-      // one hands the browser the current process token so the cookie is minted.
-      if (entry !== undefined && code.length > 0 && code === entry.code()) {
-        const target = entry.url();
-        if (target.length > 0) {
-          res.writeHead(302, { location: target, "cache-control": "no-store" });
-          res.end();
-          return;
-        }
+      // The durable door: a wrong or expired code never reaches the listener, and
+      // the right one hands the browser the current process token so the cookie
+      // is minted. Every hit is audited, accepted or not.
+      const agent = String(req.headers["user-agent"] ?? "").slice(0, 140);
+      const target = entry !== undefined && code.length > 0 && code === entry.code() ? entry.url() : "";
+      onAccess?.(`entry ${target.length > 0 ? "ok" : "bad"} ua=${JSON.stringify(agent)}`);
+      if (target.length > 0) {
+        res.writeHead(302, { location: target, "cache-control": "no-store" });
+        res.end();
+        return;
       }
       res.writeHead(403, { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" });
-      res.end("opentunnel: código de entrada inválido. Abra o QR em Configurações → OpenTunnel.\n");
+      res.end("opentunnel: código de entrada inválido ou expirado. Abra o QR em Configurações → OpenTunnel.\n");
       return;
     }
 
@@ -267,10 +276,14 @@ export function apply(ctx, config) {
   /**
    * The durable entry code. DSH's launch token is minted per process, so a saved
    * URL stops working at the next restart even though the hostname and the path
-   * look identical. This code is generated once, persisted next to the toggle,
-   * and exchanged for the current token by the proxy — one scanned link, forever.
+   * look identical. This code is persisted next to the toggle and exchanged for
+   * the current token by the proxy — one scanned link, until it expires.
    */
   let entryCode = "";
+  /** When that code stops opening the door, in epoch milliseconds. */
+  let entryExpiresAt = 0;
+  /** Last few audited hits, newest last; the panel shows the tail. */
+  const recentAccess = [];
 
   /** Where the durable link lands when the configuration names no file. */
   const linkPath = () =>
@@ -281,6 +294,9 @@ export function apply(ctx, config) {
   /** Where the toggle and the entry code survive a restart. */
   const statePath = () => join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "opentunnel.json");
 
+  /** Where accepted and refused door hits are audited. */
+  const accessPath = () => join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "opentunnel-access.log");
+
   /** Read the remembered preference and entry code once, before the first activation. */
   const readPersisted = () => {
     if (!config.persist) return {};
@@ -289,21 +305,57 @@ export function apply(ctx, config) {
       return {
         enabled: typeof parsed?.enabled === "boolean" ? parsed.enabled : undefined,
         entryCode: /^[a-f0-9]{32}$/.test(parsed?.entryCode ?? "") ? parsed.entryCode : undefined,
+        entryExpiresAt: Number.isSafeInteger(parsed?.entryExpiresAt) ? parsed.entryExpiresAt : undefined,
       };
     } catch {
       return {};
     }
   };
 
-  /** Write the preference and the entry code, best effort: a read-only home must not break the toggle. */
+  /** Write the preference, the entry code and its expiry, best effort. */
   const persist = () => {
     if (!config.persist) return;
     try {
       const path = statePath();
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, `${JSON.stringify({ enabled, entryCode }, null, 2)}\n`, { mode: 0o600 });
+      writeFileSync(path, `${JSON.stringify({ enabled, entryCode, entryExpiresAt }, null, 2)}\n`, { mode: 0o600 });
     } catch {
       /* the session keeps the choice even when the home cannot */
+    }
+  };
+
+  /** Mint a fresh entry code with its lifetime, and remember it. */
+  const mintEntry = () => {
+    entryCode = randomBytes(16).toString("hex");
+    entryExpiresAt = Date.now() + Math.max(1, config.entryTtlDays) * 86_400_000;
+    persist();
+    return entryCode;
+  };
+
+  /** Whether the current code still opens the door. */
+  const entryValid = () => entryCode.length > 0 && Date.now() < entryExpiresAt;
+
+  /** The code to publish: mint a new one when the old lapsed. */
+  const ensureEntry = () => (entryValid() ? entryCode : mintEntry());
+
+  /**
+   * Append one audit line and keep the tail in memory. The door itself is behind
+   * the tunnel, where the socket peer is always loopback, so the visitor's
+   * address comes from the bridge events instead of the request.
+   */
+  const logAccess = (line) => {
+    const entry = `${new Date().toISOString()} ${line}`;
+    recentAccess.push(entry);
+    if (recentAccess.length > 8) recentAccess.shift();
+    if (!config.accessLog) return;
+    try {
+      const path = accessPath();
+      mkdirSync(dirname(path), { recursive: true });
+      appendFileSync(path, `${entry}\n`, { mode: 0o600 });
+      // One rotation keeps the file from growing without a bound.
+      if (statSync(path).size > 512 * 1024) renameSync(path, `${path}.1`);
+    } catch {
+      /* auditing never breaks serving */
     }
   };
 
@@ -341,13 +393,16 @@ export function apply(ctx, config) {
     return host.length === 0 ? "" : tokenisedUrl(`https://${host}/`);
   };
 
-  /** The durable link: stable across restarts because the code is, and it exchanges for the live token. */
+  /** The durable link: stable across restarts while the code lives, and it exchanges for the live token. */
   const currentEntryUrl = () => {
     const host = tunnelHost();
-    return host.length === 0 || entryCode.length === 0 ? "" : `https://${host}${ENTRY_PREFIX}${entryCode}`;
+    return host.length === 0 || !entryValid() ? "" : `https://${host}${ENTRY_PREFIX}${entryCode}`;
   };
 
   const publishLink = () => {
+    ensureEntry();
+    // A fresh code is only useful once the route answers, and it does the moment
+    // the listener is up: the proxy is not tied to the tunnel's hostname.
     const link = currentEntryUrl() || currentLink();
     if (link.length === 0) return;
     if (config.printLink) {
@@ -379,9 +434,10 @@ export function apply(ctx, config) {
           port: config.rewritePort,
           targetPort: port,
           entry: {
-            code: () => entryCode,
+            code: () => (entryValid() ? entryCode : ""),
             url: () => currentLink(),
           },
+          onAccess: logAccess,
         });
         upstreamPort = rewrite.port;
         state.proxyPort = rewrite.port;
@@ -405,6 +461,9 @@ export function apply(ctx, config) {
           if (event.type === "connected") state.phase = "connected";
           if (event.type === "reconnecting" || event.type === "disconnected") state.phase = event.type;
           if (event.type === "stopped" && enabled) state.phase = "off";
+          // The tunnel terminates TLS, so the bridge is the only place the
+          // visitor's own address exists; the proxy only ever sees loopback.
+          if (event.type === "connection-opened") logAccess(`bridge open peer=${event.peer ?? "?"} route=${event.route ?? "?"}`);
         },
       });
       if (disposed || !enabled) {
@@ -490,6 +549,10 @@ export function apply(ctx, config) {
     proxyPort: state.proxyPort,
     panelPath: config.panelPath,
     linkFile: linkPath(),
+    accessFile: accessPath(),
+    entryExpiresAt: entryExpiresAt > 0 ? new Date(entryExpiresAt).toISOString() : "",
+    entryTtlDays: config.entryTtlDays,
+    recent: [...recentAccess],
     attachedAt: state.attachedAt,
     events: [...state.events],
     ...(state.error.length > 0 ? { error: state.error } : {}),
@@ -557,7 +620,15 @@ export function apply(ctx, config) {
     routeGet("/state", async () => json({ ok: true, ...snapshot() })),
     routePost("/enable", async () => ({ ok: true, ...(await serialize(() => setEnabled(true))) })),
     routePost("/disable", async () => ({ ok: true, ...(await serialize(() => setEnabled(false))) })),
+    routePost("/rotate", async () => {
+      // Revocation: the old code stops at once, every link built from it dies.
+      const previous = entryCode.slice(0, 8);
+      mintEntry();
+      logAccess(`entry rotated from=${previous}…`);
+      return { ok: true, ...snapshot() };
+    }),
     routeGet("/link", async () => {
+      ensureEntry();
       const link = currentEntryUrl() || currentLink();
       if (link.length === 0) {
         return json(
@@ -565,9 +636,12 @@ export function apply(ctx, config) {
           409,
         );
       }
-      return json({ ok: true, url: link, durable: link === currentEntryUrl(), host: tunnelHost() });
+      return json({ ok: true, url: link, durable: link === currentEntryUrl(), host: tunnelHost(), entryExpiresAt: snapshot().entryExpiresAt });
     }),
     routeGet("/qr", async () => {
+      // Opening the panel is what renews an elapsed link, so the QR on screen is
+      // always one that works.
+      ensureEntry();
       const link = currentEntryUrl() || currentLink();
       if (link.length === 0) {
         return json(
@@ -578,7 +652,13 @@ export function apply(ctx, config) {
       // The QR carries either the durable entry code or this process's token, so
       // it is rendered here, behind the panel token, and never in an <img> URL a
       // third party could log.
-      return json({ ok: true, url: link, durable: link === currentEntryUrl(), svg: renderSVG(link, { ecc: "L", border: 1 }) });
+      return json({
+        ok: true,
+        url: link,
+        durable: link === currentEntryUrl(),
+        entryExpiresAt: snapshot().entryExpiresAt,
+        svg: renderSVG(link, { ecc: "L", border: 1 }),
+      });
     }),
   ];
 
@@ -615,6 +695,8 @@ export function apply(ctx, config) {
             rewrite: { type: "boolean", required: true },
             proxyPort: { type: "number", required: true },
             linkFile: { type: "string" },
+            accessFile: { type: "string" },
+            entryExpiresAt: { type: "string" },
             error: { type: "string" },
           },
         },
@@ -628,6 +710,8 @@ export function apply(ctx, config) {
               `\nlink/QR: Configurações → OpenTunnel · arquivo: ${
                 value.linkFile.length > 0 ? value.linkFile : "no terminal do DSH"
               }` +
+              (value.entryExpiresAt === undefined ? "" : `\nlink de entrada vence em ${value.entryExpiresAt}`) +
+              (value.accessFile === undefined ? "" : `\nauditoria: ${value.accessFile}`) +
               (value.error === undefined ? "" : `\nerro: ${value.error}`),
           },
         ],
@@ -643,6 +727,8 @@ export function apply(ctx, config) {
           rewrite: value.rewrite,
           proxyPort: value.proxyPort,
           ...(value.linkFile.length > 0 ? { linkFile: value.linkFile } : {}),
+          ...(value.accessFile.length > 0 ? { accessFile: value.accessFile } : {}),
+          ...(value.entryExpiresAt.length > 0 ? { entryExpiresAt: value.entryExpiresAt } : {}),
           ...(value.error === undefined ? {} : { error: value.error }),
         };
       },
@@ -657,7 +743,8 @@ export function apply(ctx, config) {
 
   const persisted = readPersisted();
   if (persisted.enabled !== undefined) enabled = persisted.enabled;
-  entryCode = persisted.entryCode ?? randomBytes(16).toString("hex");
-  if (persisted.entryCode === undefined) persist();
+  entryCode = persisted.entryCode ?? "";
+  entryExpiresAt = persisted.entryExpiresAt ?? 0;
+  if (!entryValid()) mintEntry();
   if (enabled) void serialize(() => start());
 }

@@ -10,8 +10,10 @@ roteador.
 ## Como se usa
 
 1. **Configurações → OpenTunnel** (no menu da conta, no pé da barra lateral).
-2. Ligue **Túnel público**. Na primeira vez leva uns 30 s: o túnel é criado e o
-   certificado é emitido por ACME. Da segunda vez anexa em segundos.
+2. Ligue **Túnel público** — ele nasce **desligado**, de propósito: agente
+   alcançável de fora é um estado que se pede, não um que se herda. Na primeira
+   vez leva uns 30 s: o túnel é criado e o certificado é emitido por ACME. Da
+   segunda vez anexa em segundos.
 3. Aponte a câmera do celular para o QR. Ele abre
    `https://<host>/e/<código>`; o túnel troca esse código pelo token do processo
    atual e o DSH devolve um cookie assinado de 30 dias. Depois disso o celular
@@ -34,11 +36,16 @@ o hostname e o caminho continuam idênticos — então qualquer link salvo, favo
 ou QR antigo passa a responder `401 dsh web authentication required`, mesmo
 parecendo a mesma URL.
 
-O `/e/<código>` resolve isso: o código é gerado uma vez, fica em
-`$DSH_HOME/opentunnel.json` e o proxy o troca pelo token vivo a cada abertura.
-O link não muda quando o DSH reinicia. Ele só depende do hostname do túnel (que
-também é estável, porque a identidade fica em
-`%USERPROFILE%\.local\share\opentunnel\`) e do túnel estar ligado.
+O `/e/<código>` resolve isso: o código fica em `$DSH_HOME/opentunnel.json` e o
+proxy o troca pelo token vivo a cada abertura. O link não muda quando o DSH
+reinicia. Ele só depende do hostname do túnel (que também é estável, porque a
+identidade fica em `%USERPROFILE%\.local\share\opentunnel\`) e do túnel estar
+ligado.
+
+O código **expira** (`entryTtlDays`, padrão 7 dias) e é renovado ao abrir a
+página de Configurações ou ao apertar **Novo link**. Como o celular que já
+entrou passa a usar o cookie de 30 dias, a rotação do código não desloga quem
+já está dentro — ela só invalida links antigos.
 
 ## Por que existe um proxy no meio
 
@@ -91,7 +98,7 @@ dsh --profile web
 
 | chave | padrão | o que faz |
 | --- | --- | --- |
-| `enabled` | `true` | Estado **do primeiro boot**. Depois disso, quem manda é o interruptor. |
+| `enabled` | `false` | Estado **do primeiro boot**. Depois disso, quem manda é o interruptor. |
 | `routeName` | `@` | `@` serve o hostname do túnel; um rótulo DNS serve `<rota>.<hostname>`. |
 | `profile` | `dsh` | Nome do profile do OpenTunnel que guarda a identidade (token + chave + cert). |
 | `api` | `""` | Control plane; vazio segue `$OPENTUNNEL_API`, depois `opentunnel.xyz`. |
@@ -100,6 +107,8 @@ dsh --profile web
 | `rewritePort` | `0` | Porta do proxy; `0` pede uma ao SO. |
 | `targetPort` | `0` | Alvo do proxy; `0` lê a porta viva do listener. |
 | `panelPath` | `/opentunnel` | Família de rotas que a página consome. |
+| `entryTtlDays` | `7` | Validade do link de entrada. Abrir a página de Configurações renova. |
+| `accessLog` | `true` | Grava uma linha por acesso à porta e por conexão do bridge em `$DSH_HOME/opentunnel-access.log`. |
 | `linkFile` | `""` | Onde gravar o link permanente; vazio usa `$DSH_HOME/opentunnel-link.txt`. |
 | `printLink` | `true` | Imprime o link no terminal quando a rota anexa. |
 | `persist` | `true` | Guarda o interruptor **e o código de entrada** em `$DSH_HOME/opentunnel.json`. Desligado, o link muda a cada boot. |
@@ -116,12 +125,29 @@ Todas exigem o header `x-dsh-opentunnel`, cujo valor o Host injeta no documento
 | `POST /opentunnel/disable` | fecha a rota |
 | `GET /opentunnel/link` | link permanente (409 enquanto não anexa) |
 | `GET /opentunnel/qr` | o mesmo link como SVG de QR |
+| `POST /opentunnel/rotate` | emite um código novo e revoga o anterior |
 
 E, **atrás do proxy** (só pelo túnel, nunca no listener local):
 
 | rota | o que faz |
 | --- | --- |
-| `GET /e/<código>` | 302 para `/?token=<token vivo>`; código errado responde 403 |
+| `GET /e/<código>` | 302 para `/?token=<token vivo>`; código errado ou vencido responde 403 |
+
+### Auditoria
+
+Cada abertura da porta entra em `$DSH_HOME/opentunnel-access.log`, aceita ou não:
+
+```
+2026-11-09T19:24:39Z entry rotated from=0fc8bf5d…
+2026-11-09T19:24:51Z bridge open peer=[2804:7f0:…]:52977 route=@
+2026-11-09T19:24:51Z entry bad ua="curl/8.21.0"
+2026-11-09T19:24:51Z entry ok ua="curl/8.21.0"
+```
+
+O endereço do visitante só existe no evento do bridge — o túnel termina o TLS
+aqui, então o proxy enxerga sempre loopback. Por isso as duas linhas: a porta diz
+*o que* chegou, o bridge diz *de onde*. O arquivo rotaciona sozinho em 512 KB, e
+as últimas linhas aparecem na própria seção de Configurações.
 
 ### Sem o proxy
 
@@ -140,10 +166,9 @@ imprime, que muda a cada reinício.
 
 - Sem token e sem código, a URL pública responde **401** em tudo — medido.
 - **O link permanente é uma credencial durável**, como uma senha: quem o tiver
-  tem o agente inteiro, ou seja execução de código nesta máquina. Ele não expira
-  com o processo (é justamente o ponto). Para revogar, apague a chave
-  `entryCode` de `~/.dsh/opentunnel.json` e reinicie o DSH — um código novo é
-  gerado e todos os links antigos morrem.
+  tem o agente inteiro, ou seja execução de código nesta máquina. Ele expira em
+  `entryTtlDays`, e **Novo link** revoga o anterior na hora. Quem já entrou
+  continua dentro pelo cookie, então rotacionar não derruba o celular.
 - O código tem 128 bits e nunca vai para o contexto do modelo: ele sai no
   terminal, no `opentunnel-link.txt` (modo 600) e na página de Configurações.
 - O QR é renderizado no Host, atrás do token da página, e chega como SVG por

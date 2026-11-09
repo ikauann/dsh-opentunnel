@@ -183,6 +183,28 @@ window.__ModuleLoader__.load({
       }
     };
 
+    /** Short local date for the entry link's expiry. */
+    const fmtDate = (iso) => {
+      const date = new Date(iso);
+      return Number.isNaN(date.getTime())
+        ? ""
+        : date.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
+    };
+
+    /** One audit line, read back as "what happened, when". */
+    const describeAccess = (recent) => {
+      if (!Array.isArray(recent) || recent.length === 0) return "";
+      const line = recent[recent.length - 1] ?? "";
+      const [iso, kind, verdict] = line.split(" ");
+      const date = new Date(iso);
+      const time = Number.isNaN(date.getTime())
+        ? ""
+        : date.toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+      if (kind !== "entry") return `Última conexão do túnel · ${time}`;
+      if (verdict === "rotated") return `Link renovado · ${time}`;
+      return `Última entrada ${verdict === "ok" ? "aceita" : "recusada"} · ${time}`;
+    };
+
     /** The switch: a button, because a checkbox reads wrong in a settings row. */
     function Switch({ checked, disabled, onToggle }) {
       return h(
@@ -208,6 +230,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState("");
       const [copied, setCopied] = useState(false);
+      const [tick, setTick] = useState(0);
       const alive = useRef(true);
 
       useEffect(() => {
@@ -266,7 +289,7 @@ window.__ModuleLoader__.load({
         return () => {
           live = false;
         };
-      }, [state?.phase, state?.url]);
+      }, [state?.phase, state?.url, tick]);
 
       const toggle = useCallback(async () => {
         if (busy) return;
@@ -298,10 +321,27 @@ window.__ModuleLoader__.load({
         }
       }, [link]);
 
+      const rotate = useCallback(async () => {
+        if (busy) return;
+        setBusy(true);
+        setError("");
+        setCopied(false);
+        try {
+          const next = await call("/rotate", { method: "POST" });
+          if (!alive.current) return;
+          setState(next);
+          // Same phase and URL, new code: bump the tick so the QR is re-fetched.
+          setTick((value) => value + 1);
+        } catch (failure) {
+          if (alive.current) setError(failure.message);
+        } finally {
+          if (alive.current) setBusy(false);
+        }
+      }, [busy]);
+
       const enabled = state?.enabled !== false;
       const phase = state?.phase ?? "off";
       const pill = { ...S.pill, ...(phase === "connected" ? S.pillOn : phase === "error" ? S.pillError : {}) };
-
       return h(
         "div",
         { style: S.root },
@@ -338,6 +378,7 @@ window.__ModuleLoader__.load({
           ),
           state === undefined && error.length === 0 ? h("div", { style: S.hint }, "Lendo o estado…") : null,
           state?.url && phase === "connected" ? h("div", { style: S.mono }, state.url) : null,
+          state?.recent?.length > 0 ? h("div", { style: S.hint }, describeAccess(state.recent)) : null,
           phase === "starting"
             ? h("div", { style: S.hint }, "Criando a rota e o certificado na primeira vez; isso leva uns 30 segundos.")
             : null,
@@ -363,13 +404,17 @@ window.__ModuleLoader__.load({
                   h(
                     "div",
                     { style: S.hint },
-                    "Este link é permanente: ele vale depois de reiniciar o DSH. Ao abrir, o túnel troca o código pelo token da sessão e o DSH devolve um cookie de 30 dias — por isso o celular entra direto.",
+                    "Este link é permanente enquanto durar o código: vale depois de reiniciar o DSH. Ao abrir, o túnel troca o código pelo token da sessão e o DSH devolve um cookie de 30 dias — por isso o celular entra direto.",
                   ),
+                  state?.entryExpiresAt
+                    ? h("div", { style: S.hint }, `Código válido até ${fmtDate(state.entryExpiresAt)}. Aberta esta página, ele se renova sozinho.`)
+                    : null,
                   h(
                     "div",
                     { style: S.row },
                     h("button", { type: "button", style: S.button, onClick: copy }, copied ? "Copiado" : "Copiar link"),
                     h("a", { style: S.button, href: link, target: "_blank", rel: "noreferrer" }, "Abrir aqui"),
+                    h("button", { type: "button", style: S.button, onClick: rotate, disabled: busy }, "Novo link"),
                   ),
                 ),
               ),
@@ -379,7 +424,7 @@ window.__ModuleLoader__.load({
           ? h(
               "p",
               { style: S.hint },
-              "Quem tiver este link tem o mesmo acesso que você nesta máquina, e ele não expira com o processo. Para revogar, apague o entryCode de ~/.dsh/opentunnel.json e reinicie o DSH — um código novo é gerado, e os links antigos morrem.",
+              "Quem tiver este link tem o mesmo acesso que você nesta máquina. Ele expira sozinho, e “Novo link” revoga o anterior na hora — o celular que já entrou continua dentro, pelo cookie.",
             )
           : null,
       );

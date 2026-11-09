@@ -11,7 +11,7 @@
  *
  * Usage: node test/smoke.mjs <token-do-DSH> [targetPort]
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import https from 'node:https'
 import crypto from 'node:crypto'
@@ -55,8 +55,11 @@ const ctx = {
   },
 }
 
-apply(ctx, Config({ profile: 'dsh-e2e', rewrite: true, printLink: false, enabled: false, linkFile: 'link.txt' }))
+// Um código vencido no disco: o boot tem de trocá-lo por um novo.
+const statePath = join(process.env.DSH_HOME, 'opentunnel.json')
+writeFileSync(statePath, JSON.stringify({ enabled: false, entryCode: 'a'.repeat(32), entryExpiresAt: 1 }))
 
+apply(ctx, Config({ profile: 'dsh-e2e', rewrite: true, printLink: false, enabled: false, linkFile: 'link.txt' }))
 const table = []
 for (const inject of injectors) inject(table)
 const panelToken = table.find((row) => row.name === '__DSH_OPENTUNNEL__')?.value?.token
@@ -116,6 +119,7 @@ const link = await get('/link')
 const hostname = new URL(clean).hostname
 const code = JSON.parse(readFileSync(join(process.env.DSH_HOME, 'opentunnel.json'), 'utf8')).entryCode
 check('/link devolve o link permanente', link.body.url === `https://${hostname}/e/${code}` && link.body.durable === true)
+check('código vencido foi renovado no boot', code !== 'a'.repeat(32) && /^[a-f0-9]{32}$/.test(code))
 const qr = await get('/qr')
 check('/qr devolve SVG do link permanente', qr.body.svg.startsWith('<svg') && qr.body.url === link.body.url)
 
@@ -173,6 +177,18 @@ const ws = await new Promise((resolve) => {
   setTimeout(() => resolve('timeout'), 20000)
 })
 check('upgrade WebSocket -> 101', ws === 101)
+
+// ── rotação e auditoria ────────────────────────────────────────────────────
+const rotated = await post('/rotate')
+check('/rotate responde ok', rotated.body.ok === true && rotated.body.entryExpiresAt?.length > 0)
+const revoked = await fetch(`${clean}/e/${code}`, { redirect: 'manual' })
+check('código antigo recusado após rotacionar', revoked.status === 403)
+const newCode = JSON.parse(readFileSync(statePath, 'utf8')).entryCode
+check('código novo é outro e tem 32 hex', newCode !== code && /^[a-f0-9]{32}$/.test(newCode))
+const freshDoor = await fetch(`${clean}/e/${newCode}`, { redirect: 'manual' })
+check('código novo abre a porta', freshDoor.status === 302)
+const audit = readFileSync(join(process.env.DSH_HOME, 'opentunnel-access.log'), 'utf8')
+check('auditoria registrou entrada e rotação', audit.includes('entry ok') && audit.includes('rotated'))
 
 // ── desligar ───────────────────────────────────────────────────────────────
 const disabled = await post('/disable')

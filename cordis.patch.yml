@@ -1,18 +1,25 @@
 # dsh-opentunnel: a public HTTPS route to this Web listener.
 #
+# `enabled: false` means the route is off at boot: the public URL only exists
+# after the user flips the switch in Settings. That is the default on purpose —
+# a remote-reachable agent should be a deliberate state, not a standing one.
+#
 # `rewrite: true` puts a loopback proxy in front of the listener and points the
 # tunnel at it, so Connection's Host/Origin fence sees loopback and the GUI
 # works from the phone with no `--trusted-host` flag. Turning it off requires
 # starting `dsh --profile web --trusted-host <tunnel host>`.
 #
-# `enabled` is the first-boot state only: afterwards the Settings switch owns it
-# and the choice is remembered in `$DSH_HOME/opentunnel.json`.
+# After the first boot the Settings switch owns `enabled`, the durable entry code
+# lives in `$DSH_HOME/opentunnel.json`, and every door hit is audited in
+# `$DSH_HOME/opentunnel-access.log`.
 - insert:
     - id: opentunnel
       name: '@ikauann/dsh-opentunnel'
       config:
-        enabled: true
+        enabled: false
         routeName: '@'
         profile: dsh
         rewrite: true
+        entryTtlDays: 7
+        accessLog: true
         printLink: true
